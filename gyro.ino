@@ -158,6 +158,28 @@ struct RxChannel {
   uint8_t filterShift;
 };
 
+struct ReceiverSnapshot {
+  PulseSnapshot steering;
+  PulseSnapshot gain;
+  PulseSnapshot damper;
+  PulseSnapshot recal;
+  bool steeringValid;
+  bool gainValid;
+  bool damperValid;
+  bool recalValid;
+};
+
+struct ControlTerms {
+  int32_t gyroZCentiDps;
+  int32_t absGyroCentiDps;
+  int16_t effectiveSmoothingQ1000;
+  int16_t effectiveDeadbandCentiDps;
+  int16_t progressiveFactorQ1000;
+  int16_t effectiveGainQ1000;
+  int16_t driverPriorityFactorQ1000;
+  int32_t activeCorrectionLimitUs;
+};
+
 enum RecalState {
   RECAL_IDLE,
   RECAL_STABILITY_CHECK,
@@ -227,6 +249,7 @@ bool hasEnoughGoodSamples(uint16_t goodSamples, uint16_t totalSamples);
 int32_t rawGyroToCentiDps(int16_t rawZ);
 PulseSnapshot copyChannel(volatile RxChannel &channel);
 bool isPulseValid(const PulseSnapshot &pulse, uint32_t nowUs);
+ReceiverSnapshot readReceiverSnapshot(uint32_t nowUs);
 void handlePulseEdge(volatile RxChannel &channel, bool isHigh, uint32_t nowUs);
 void steeringRxIsr();
 void gainRxIsr();
@@ -250,7 +273,10 @@ int16_t calculateAdaptiveDeadbandCentiDps(int16_t baseDeadbandCentiDps,
                                           int32_t absGyroCentiDps);
 int16_t calculateProgressiveGainFactorQ1000(int32_t absGyroCentiDps);
 int16_t calculateDriverPriorityFactorQ1000(uint16_t receiverPulseUs);
+ControlTerms buildControlTerms(uint16_t receiverPulseUs, int32_t gyroZCentiDps);
+int16_t updateGyroCorrectionUs(ControlTerms &terms);
 uint16_t buildServoCommand(uint16_t receiverPulseUs, int16_t correctionUs);
+void setCenteredSafeOutput();
 void startRecalibration(uint32_t nowUs, uint16_t neutralUs);
 void cancelRecalibration();
 void finishRecalibration();
@@ -263,7 +289,10 @@ void updateRecalibration(uint32_t nowUs,
 bool recalibrationOwnsServo();
 void triggerStatusLedBlinks(uint8_t blinkCount, uint16_t onMs, uint16_t offMs);
 void updateStatusLed(uint32_t nowMs);
-void runControlLoop(uint32_t nowUs);
+void runControlLoop(uint32_t nowUs, uint32_t nowMs);
+void debugSafeControl(bool radioOk,
+                      const ReceiverSnapshot &rx,
+                      uint16_t steeringPulseUs);
 void printScaled(int32_t value, uint16_t scale, uint8_t decimals);
 void debugPrint(bool radioOk,
                 uint16_t steeringPulseUs,
@@ -335,6 +364,19 @@ PulseSnapshot copyChannel(volatile RxChannel &channel) {
 
 bool isPulseValid(const PulseSnapshot &pulse, uint32_t nowUs) {
   return pulse.hasPulse && (uint32_t)(nowUs - pulse.lastPulseUs) <= RX_SIGNAL_TIMEOUT_US;
+}
+
+ReceiverSnapshot readReceiverSnapshot(uint32_t nowUs) {
+  ReceiverSnapshot rx;
+  rx.steering = copyChannel(steeringChannel);
+  rx.gain = copyChannel(gainChannel);
+  rx.damper = copyChannel(damperChannel);
+  rx.recal = copyChannel(recalChannel);
+  rx.steeringValid = isPulseValid(rx.steering, nowUs);
+  rx.gainValid = isPulseValid(rx.gain, nowUs);
+  rx.damperValid = isPulseValid(rx.damper, nowUs);
+  rx.recalValid = isPulseValid(rx.recal, nowUs);
+  return rx;
 }
 
 void handlePulseEdge(volatile RxChannel &channel, bool isHigh, uint32_t nowUs) {
@@ -708,6 +750,75 @@ int16_t calculateDriverPriorityFactorQ1000(uint16_t receiverPulseUs) {
   return (int16_t)(FIXED_SCALE - reduction);
 }
 
+ControlTerms buildControlTerms(uint16_t receiverPulseUs, int32_t gyroZCentiDps) {
+  ControlTerms terms;
+  terms.gyroZCentiDps = gyroZCentiDps;
+  terms.absGyroCentiDps = absInt32(gyroZCentiDps);
+  terms.effectiveSmoothingQ1000 =
+    calculateAdaptiveSmoothingQ1000(activeSmoothingQ1000, terms.absGyroCentiDps);
+  terms.effectiveDeadbandCentiDps =
+    calculateAdaptiveDeadbandCentiDps(activeGyroDeadbandCentiDps,
+                                      terms.absGyroCentiDps);
+  terms.progressiveFactorQ1000 =
+    calculateProgressiveGainFactorQ1000(terms.absGyroCentiDps);
+  terms.effectiveGainQ1000 =
+    (int16_t)(((int32_t)activeGyroGainQ1000 * terms.progressiveFactorQ1000) /
+              FIXED_SCALE);
+  terms.driverPriorityFactorQ1000 =
+    calculateDriverPriorityFactorQ1000(receiverPulseUs);
+  terms.activeCorrectionLimitUs =
+    ((int32_t)GYRO_CORRECTION_LIMIT_US * terms.driverPriorityFactorQ1000) /
+    FIXED_SCALE;
+  return terms;
+}
+
+int16_t updateGyroCorrectionUs(ControlTerms &terms) {
+  if (!activeGyroEnabled) {
+    filteredCorrectionUsQ1000 = 0;
+    terms.effectiveGainQ1000 = 0;
+  } else {
+    int32_t gyroForCorrectionCentiDps = terms.gyroZCentiDps;
+    if (gyroForCorrectionCentiDps > -terms.effectiveDeadbandCentiDps &&
+        gyroForCorrectionCentiDps < terms.effectiveDeadbandCentiDps) {
+      gyroForCorrectionCentiDps = 0;
+    }
+
+    int32_t correctionUs =
+      (gyroForCorrectionCentiDps * terms.effectiveGainQ1000) /
+      ((int32_t)DPS_SCALE * FIXED_SCALE);
+    if (GYRO_REVERSE) {
+      correctionUs = -correctionUs;
+    }
+
+    correctionUs = clampInt32(correctionUs,
+                              -GYRO_CORRECTION_LIMIT_US,
+                              GYRO_CORRECTION_LIMIT_US);
+    correctionUs = clampInt32(correctionUs,
+                              -terms.activeCorrectionLimitUs,
+                              terms.activeCorrectionLimitUs);
+
+    int32_t correctionUsQ1000 = correctionUs * (int32_t)FIXED_SCALE;
+    filteredCorrectionUsQ1000 =
+      (filteredCorrectionUsQ1000 * terms.effectiveSmoothingQ1000 +
+       correctionUsQ1000 * (FIXED_SCALE - terms.effectiveSmoothingQ1000)) /
+      FIXED_SCALE;
+
+    filteredCorrectionUsQ1000 =
+      clampInt32(filteredCorrectionUsQ1000,
+                 -terms.activeCorrectionLimitUs * (int32_t)FIXED_SCALE,
+                 terms.activeCorrectionLimitUs * (int32_t)FIXED_SCALE);
+  }
+
+  int32_t roundedCorrectionUs =
+    filteredCorrectionUsQ1000 >= 0 ?
+      (filteredCorrectionUsQ1000 + (FIXED_SCALE / 2)) / FIXED_SCALE :
+      (filteredCorrectionUsQ1000 - (FIXED_SCALE / 2)) / FIXED_SCALE;
+  int16_t gyroCorrectionUs = (int16_t)roundedCorrectionUs;
+  return clampInt16(gyroCorrectionUs,
+                    -GYRO_CORRECTION_LIMIT_US,
+                    GYRO_CORRECTION_LIMIT_US);
+}
+
 uint16_t buildServoCommand(uint16_t receiverPulseUs, int16_t correctionUs) {
   int16_t steeringDeltaUs =
     (int16_t)receiverPulseUs - (int16_t)steeringNeutralUs;
@@ -724,6 +835,11 @@ uint16_t buildServoCommand(uint16_t receiverPulseUs, int16_t correctionUs) {
                              (int16_t)SERVO_LEFT_LIMIT_US,
                              (int16_t)SERVO_RIGHT_LIMIT_US);
   return (uint16_t)servoOutputUs;
+}
+
+void setCenteredSafeOutput() {
+  filteredCorrectionUsQ1000 = 0;
+  setServoPulseUs(SERVO_CENTER_US);
 }
 
 void startRecalibration(uint32_t nowUs, uint16_t neutralUs) {
@@ -1034,64 +1150,54 @@ void debugPrint(bool radioOk,
   Serial.println(servoPulseUs);
 }
 
-void runControlLoop(uint32_t nowUs) {
-  PulseSnapshot steering = copyChannel(steeringChannel);
-  PulseSnapshot gain = copyChannel(gainChannel);
-  PulseSnapshot damper = copyChannel(damperChannel);
-  PulseSnapshot recal = copyChannel(recalChannel);
+void debugSafeControl(bool radioOk,
+                      const ReceiverSnapshot &rx,
+                      uint16_t steeringPulseUs) {
+  debugPrint(radioOk,
+             steeringPulseUs,
+             rx.gain.pulseUs,
+             rx.gainValid,
+             rx.damper.pulseUs,
+             rx.damperValid,
+             recalButtonActive,
+             0,
+             0,
+             activeSmoothingQ1000,
+             activeGyroDeadbandCentiDps,
+             PROGRESSIVE_GAIN_MIN_FACTOR_Q1000,
+             0,
+             0,
+             FIXED_SCALE,
+             SERVO_CENTER_US);
+}
 
-  bool steeringValid = isPulseValid(steering, nowUs);
-  bool gainValid = isPulseValid(gain, nowUs);
-  bool damperValid = isPulseValid(damper, nowUs);
-  bool recalValid = isPulseValid(recal, nowUs);
+void runControlLoop(uint32_t nowUs, uint32_t nowMs) {
+  ReceiverSnapshot rx = readReceiverSnapshot(nowUs);
 
-  updateGainAndDamper(gain, gainValid, damper, damperValid);
-  updateRecalibration(nowUs, millis(), recal, recalValid, steering, steeringValid);
+  updateGainAndDamper(rx.gain, rx.gainValid, rx.damper, rx.damperValid);
+  updateRecalibration(nowUs,
+                      nowMs,
+                      rx.recal,
+                      rx.recalValid,
+                      rx.steering,
+                      rx.steeringValid);
 
-  if (!steeringValid) {
-    filteredCorrectionUsQ1000 = 0;
-    setServoPulseUs(SERVO_CENTER_US);
-    debugPrint(false,
-               SERVO_CENTER_US,
-               gain.pulseUs,
-               gainValid,
-               damper.pulseUs,
-               damperValid,
-               recalButtonActive,
-               0,
-               0,
-               activeSmoothingQ1000,
-               activeGyroDeadbandCentiDps,
-               PROGRESSIVE_GAIN_MIN_FACTOR_Q1000,
-               0,
-               0,
-               FIXED_SCALE,
-               SERVO_CENTER_US);
+  if (!rx.steeringValid) {
+    setCenteredSafeOutput();
+    if (DEBUG_SERIAL) {
+      debugSafeControl(false, rx, SERVO_CENTER_US);
+    }
     return;
   }
 
   uint16_t receiverPulseUs =
-    clampPulse(steering.pulseUs, RX_COMMAND_MIN_US, RX_COMMAND_MAX_US);
+    clampPulse(rx.steering.pulseUs, RX_COMMAND_MIN_US, RX_COMMAND_MAX_US);
 
   if (recalibrationOwnsServo()) {
-    filteredCorrectionUsQ1000 = 0;
-    setServoPulseUs(SERVO_CENTER_US);
-    debugPrint(true,
-               receiverPulseUs,
-               gain.pulseUs,
-               gainValid,
-               damper.pulseUs,
-               damperValid,
-               recalButtonActive,
-               0,
-               0,
-               activeSmoothingQ1000,
-               activeGyroDeadbandCentiDps,
-               PROGRESSIVE_GAIN_MIN_FACTOR_Q1000,
-               0,
-               0,
-               FIXED_SCALE,
-               SERVO_CENTER_US);
+    setCenteredSafeOutput();
+    if (DEBUG_SERIAL) {
+      debugSafeControl(true, rx, receiverPulseUs);
+    }
     return;
   }
 
@@ -1103,86 +1209,29 @@ void runControlLoop(uint32_t nowUs) {
     gyroZCentiDps = 0;
   }
 
-  int32_t absGyroCentiDps = absInt32(gyroZCentiDps);
-  int16_t effectiveSmoothingQ1000 =
-    calculateAdaptiveSmoothingQ1000(activeSmoothingQ1000, absGyroCentiDps);
-  int16_t effectiveDeadbandCentiDps =
-    calculateAdaptiveDeadbandCentiDps(activeGyroDeadbandCentiDps, absGyroCentiDps);
-  int16_t progressiveFactorQ1000 =
-    calculateProgressiveGainFactorQ1000(absGyroCentiDps);
-  int16_t effectiveGainQ1000 =
-    (int16_t)(((int32_t)activeGyroGainQ1000 * progressiveFactorQ1000) /
-              FIXED_SCALE);
-  int16_t driverPriorityFactorQ1000 =
-    calculateDriverPriorityFactorQ1000(receiverPulseUs);
-  int32_t activeCorrectionLimitUs =
-    ((int32_t)GYRO_CORRECTION_LIMIT_US * driverPriorityFactorQ1000) /
-    FIXED_SCALE;
-
-  if (!activeGyroEnabled) {
-    filteredCorrectionUsQ1000 = 0;
-    effectiveGainQ1000 = 0;
-  } else {
-    int32_t gyroForCorrectionCentiDps = gyroZCentiDps;
-    if (gyroForCorrectionCentiDps > -effectiveDeadbandCentiDps &&
-        gyroForCorrectionCentiDps < effectiveDeadbandCentiDps) {
-      gyroForCorrectionCentiDps = 0;
-    }
-
-    int32_t correctionUs =
-      (gyroForCorrectionCentiDps * effectiveGainQ1000) /
-      ((int32_t)DPS_SCALE * FIXED_SCALE);
-    if (GYRO_REVERSE) {
-      correctionUs = -correctionUs;
-    }
-
-    correctionUs = clampInt32(correctionUs,
-                              -GYRO_CORRECTION_LIMIT_US,
-                              GYRO_CORRECTION_LIMIT_US);
-    correctionUs = clampInt32(correctionUs,
-                              -activeCorrectionLimitUs,
-                              activeCorrectionLimitUs);
-
-    int32_t correctionUsQ1000 = correctionUs * (int32_t)FIXED_SCALE;
-    filteredCorrectionUsQ1000 =
-      (filteredCorrectionUsQ1000 * effectiveSmoothingQ1000 +
-       correctionUsQ1000 * (FIXED_SCALE - effectiveSmoothingQ1000)) /
-      FIXED_SCALE;
-
-    filteredCorrectionUsQ1000 =
-      clampInt32(filteredCorrectionUsQ1000,
-                 -activeCorrectionLimitUs * (int32_t)FIXED_SCALE,
-                 activeCorrectionLimitUs * (int32_t)FIXED_SCALE);
-  }
-
-  int32_t roundedCorrectionUs =
-    filteredCorrectionUsQ1000 >= 0 ?
-      (filteredCorrectionUsQ1000 + (FIXED_SCALE / 2)) / FIXED_SCALE :
-      (filteredCorrectionUsQ1000 - (FIXED_SCALE / 2)) / FIXED_SCALE;
-  int16_t gyroCorrectionUs = (int16_t)roundedCorrectionUs;
-  gyroCorrectionUs = clampInt16(gyroCorrectionUs,
-                                -GYRO_CORRECTION_LIMIT_US,
-                                GYRO_CORRECTION_LIMIT_US);
-
+  ControlTerms terms = buildControlTerms(receiverPulseUs, gyroZCentiDps);
+  int16_t gyroCorrectionUs = updateGyroCorrectionUs(terms);
   uint16_t servoPulseUs = buildServoCommand(receiverPulseUs, gyroCorrectionUs);
   setServoPulseUs(servoPulseUs);
 
-  debugPrint(true,
-             receiverPulseUs,
-             gain.pulseUs,
-             gainValid,
-             damper.pulseUs,
-             damperValid,
-             recalButtonActive,
-             gyroZCentiDps,
-             absGyroCentiDps,
-             effectiveSmoothingQ1000,
-             effectiveDeadbandCentiDps,
-             progressiveFactorQ1000,
-             effectiveGainQ1000,
-             filteredCorrectionUsQ1000,
-             driverPriorityFactorQ1000,
-             servoPulseUs);
+  if (DEBUG_SERIAL) {
+    debugPrint(true,
+               receiverPulseUs,
+               rx.gain.pulseUs,
+               rx.gainValid,
+               rx.damper.pulseUs,
+               rx.damperValid,
+               recalButtonActive,
+               terms.gyroZCentiDps,
+               terms.absGyroCentiDps,
+               terms.effectiveSmoothingQ1000,
+               terms.effectiveDeadbandCentiDps,
+               terms.progressiveFactorQ1000,
+               terms.effectiveGainQ1000,
+               filteredCorrectionUsQ1000,
+               terms.driverPriorityFactorQ1000,
+               servoPulseUs);
+  }
 }
 
 void setup() {
@@ -1222,6 +1271,6 @@ void loop() {
 
   if ((uint32_t)(nowUs - lastControlUs) >= CONTROL_INTERVAL_US) {
     lastControlUs = nowUs;
-    runControlLoop(nowUs);
+    runControlLoop(nowUs, nowMs);
   }
 }
