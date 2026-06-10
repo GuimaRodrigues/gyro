@@ -12,6 +12,7 @@
   - CH6 damper / anti-hunting: D4 / Pin Change Interrupt
   - CH4 botao de recalibracao: D7 / Pin Change Interrupt
   - Servo de direcao: D9, sinal gerado por Timer1 em 50 Hz
+  - LED onboard: LED_BUILTIN / D13 para feedback visual de recalibracao
 
   Ajustes principais:
   - CH5 ajusta o ganho do gyro. Abaixo de GYRO_GAIN_OFF_THRESHOLD_US o gyro fica
@@ -105,6 +106,12 @@ const uint16_t RECAL_SAMPLE_INTERVAL_US = 1000;
 const uint16_t RECAL_STABILITY_SAMPLES = 80;
 const uint16_t RECAL_OFFSET_SAMPLES = 300;
 
+// ------------------------- LED de status -------------------------
+const uint16_t STATUS_LED_FAST_ON_MS = 80;
+const uint16_t STATUS_LED_FAST_OFF_MS = 80;
+const uint16_t STATUS_LED_LONG_ON_MS = 350;
+const uint16_t STATUS_LED_LONG_OFF_MS = 250;
+
 // ------------------------- Debug -------------------------
 const bool DEBUG_SERIAL = false;
 const uint32_t DEBUG_BAUD = 115200;
@@ -173,6 +180,14 @@ int32_t recalRawSum = 0;
 uint16_t recalPendingNeutralUs = RX_COMMAND_CENTER_US;
 bool recalButtonActive = false;
 
+bool statusLedBlinkActive = false;
+bool statusLedIsOn = false;
+uint8_t statusLedTargetBlinks = 0;
+uint8_t statusLedCompletedBlinks = 0;
+uint16_t statusLedOnMs = 0;
+uint16_t statusLedOffMs = 0;
+uint32_t statusLedLastChangeMs = 0;
+
 uint16_t clampPulse(uint16_t value, uint16_t low, uint16_t high);
 int16_t clampInt16(int16_t value, int16_t low, int16_t high);
 float clampFloat(float value, float low, float high);
@@ -211,6 +226,8 @@ void updateRecalibration(uint32_t nowUs,
                          const PulseSnapshot &steering,
                          bool steeringValid);
 bool recalibrationOwnsServo();
+void triggerStatusLedBlinks(uint8_t blinkCount, uint16_t onMs, uint16_t offMs);
+void updateStatusLed(uint32_t nowMs);
 void runControlLoop(uint32_t nowUs);
 void debugPrint(bool radioOk,
                 uint16_t steeringPulseUs,
@@ -596,7 +613,9 @@ void cancelRecalibration() {
 }
 
 void finishRecalibration() {
-  if (recalGoodSamples > 0) {
+  bool recalibrationSucceeded = recalGoodSamples > 0;
+
+  if (recalibrationSucceeded) {
     gyroZOffsetRaw = (float)recalRawSum / (float)recalGoodSamples;
     steeringNeutralUs = recalPendingNeutralUs;
   }
@@ -607,6 +626,10 @@ void finishRecalibration() {
   recalRawSum = 0;
   filteredCorrectionUs = 0.0f;
   setServoPulseUs(SERVO_CENTER_US);
+
+  if (recalibrationSucceeded) {
+    triggerStatusLedBlinks(3, STATUS_LED_FAST_ON_MS, STATUS_LED_FAST_OFF_MS);
+  }
 
   if (DEBUG_SERIAL) {
     Serial.print(F("Recalibrado. Offset raw = "));
@@ -673,6 +696,7 @@ void updateRecalibration(uint32_t nowUs,
     if (readOk) {
       float gyroZDps = ((float)rawZ - gyroZOffsetRaw) / GYRO_LSB_PER_DPS;
       if (absFloat(gyroZDps) > RECAL_MAX_ABS_GYRO_DPS) {
+        triggerStatusLedBlinks(2, STATUS_LED_LONG_ON_MS, STATUS_LED_LONG_OFF_MS);
         cancelRecalibration();
         return;
       }
@@ -712,6 +736,57 @@ void updateRecalibration(uint32_t nowUs,
 
 bool recalibrationOwnsServo() {
   return recalState == RECAL_STABILITY_CHECK || recalState == RECAL_SAMPLING_OFFSET;
+}
+
+void triggerStatusLedBlinks(uint8_t blinkCount, uint16_t onMs, uint16_t offMs) {
+  if (blinkCount == 0) {
+    return;
+  }
+
+  statusLedBlinkActive = true;
+  statusLedIsOn = true;
+  statusLedTargetBlinks = blinkCount;
+  statusLedCompletedBlinks = 0;
+  statusLedOnMs = onMs;
+  statusLedOffMs = offMs;
+  statusLedLastChangeMs = millis();
+  digitalWrite(LED_BUILTIN, HIGH);
+}
+
+void updateStatusLed(uint32_t nowMs) {
+  if (!statusLedBlinkActive) {
+    if (statusLedIsOn) {
+      statusLedIsOn = false;
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+    return;
+  }
+
+  if (statusLedIsOn) {
+    if ((uint32_t)(nowMs - statusLedLastChangeMs) < statusLedOnMs) {
+      return;
+    }
+
+    statusLedIsOn = false;
+    statusLedCompletedBlinks++;
+    statusLedLastChangeMs = nowMs;
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+
+  if ((uint32_t)(nowMs - statusLedLastChangeMs) < statusLedOffMs) {
+    return;
+  }
+
+  if (statusLedCompletedBlinks >= statusLedTargetBlinks) {
+    statusLedBlinkActive = false;
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+
+  statusLedIsOn = true;
+  statusLedLastChangeMs = nowMs;
+  digitalWrite(LED_BUILTIN, HIGH);
 }
 
 void debugPrint(bool radioOk,
@@ -930,6 +1005,9 @@ void setup() {
     Serial.begin(DEBUG_BAUD);
   }
 
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
   setupServoTimer50Hz();
   setServoPulseUs(SERVO_CENTER_US);
   setupReceiverInputs();
@@ -947,6 +1025,8 @@ void setup() {
 }
 
 void loop() {
+  updateStatusLed(millis());
+
   uint32_t nowUs = micros();
 
   if ((uint32_t)(nowUs - lastControlUs) >= CONTROL_INTERVAL_US) {
