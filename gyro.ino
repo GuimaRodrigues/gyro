@@ -81,9 +81,21 @@ const float DAMPER_DEADBAND_MAX_DPS = 3.0f;
 const float DAMPER_FAILSAFE_SMOOTHING = 0.70f;
 const float DAMPER_FAILSAFE_DEADBAND_DPS = 2.0f;
 
+const float ADAPTIVE_DAMPER_LOW_DPS = 8.0f;
+const float ADAPTIVE_DAMPER_HIGH_DPS = 80.0f;
+const float ADAPTIVE_SMOOTHING_BOOST_AT_LOW_RATE = 0.06f;
+const float ADAPTIVE_SMOOTHING_REDUCTION_AT_HIGH_RATE = 0.05f;
+const float ADAPTIVE_DEADBAND_BOOST_AT_LOW_RATE_DPS = 0.6f;
+const float ADAPTIVE_DEADBAND_REDUCTION_AT_HIGH_RATE_DPS = 0.4f;
+
+const float PROGRESSIVE_GAIN_START_DPS = 20.0f;
+const float PROGRESSIVE_GAIN_FULL_DPS = 120.0f;
+const float PROGRESSIVE_GAIN_MIN_FACTOR = 0.75f;
+const float PROGRESSIVE_GAIN_MAX_FACTOR = 1.18f;
+
 const int16_t GYRO_CORRECTION_LIMIT_US = 250;
-const uint16_t DRIVER_PRIORITY_FULL_STEER_US = 350;
-const float DRIVER_PRIORITY_MIN_FACTOR = 0.60f;
+const uint16_t DRIVER_PRIORITY_FULL_STEER_US = 230;
+const float DRIVER_PRIORITY_MIN_FACTOR = 0.55f;
 
 // ------------------------- Recalibracao CH4 -------------------------
 const uint16_t RECAL_BUTTON_ACTIVE_US = 1700;
@@ -164,6 +176,7 @@ bool recalButtonActive = false;
 uint16_t clampPulse(uint16_t value, uint16_t low, uint16_t high);
 int16_t clampInt16(int16_t value, int16_t low, int16_t high);
 float clampFloat(float value, float low, float high);
+float constrainFloat(float value, float minValue, float maxValue);
 float absFloat(float value);
 float mapPulseToFloat(uint16_t pulseUs, float low, float high);
 PulseSnapshot copyChannel(volatile RxChannel &channel);
@@ -183,6 +196,9 @@ void updateGainAndDamper(const PulseSnapshot &gain,
                          bool gainValid,
                          const PulseSnapshot &damper,
                          bool damperValid);
+float calculateAdaptiveSmoothing(float baseSmoothing, float absGyroZ);
+float calculateAdaptiveDeadband(float baseDeadbandDps, float absGyroZ);
+float calculateProgressiveGainFactor(float absGyroZ);
 float calculateDriverPriorityFactor(uint16_t receiverPulseUs);
 uint16_t buildServoCommand(uint16_t receiverPulseUs, int16_t correctionUs);
 void startRecalibration(uint32_t nowUs, uint16_t neutralUs);
@@ -204,7 +220,13 @@ void debugPrint(bool radioOk,
                 bool damperValid,
                 bool ch4Active,
                 float gyroZDps,
+                float absGyroZ,
+                float effectiveSmoothing,
+                float effectiveDeadband,
+                float progressiveFactor,
+                float effectiveGain,
                 float correctionUs,
+                float driverPriorityFactor,
                 uint16_t servoPulseUs);
 
 uint16_t clampPulse(uint16_t value, uint16_t low, uint16_t high) {
@@ -223,6 +245,10 @@ float clampFloat(float value, float low, float high) {
   if (value < low) return low;
   if (value > high) return high;
   return value;
+}
+
+float constrainFloat(float value, float minValue, float maxValue) {
+  return clampFloat(value, minValue, maxValue);
 }
 
 float absFloat(float value) {
@@ -462,6 +488,57 @@ void updateGainAndDamper(const PulseSnapshot &gain,
   }
 }
 
+float calculateAdaptiveSmoothing(float baseSmoothing, float absGyroZ) {
+  float lowRateSmoothing = baseSmoothing + ADAPTIVE_SMOOTHING_BOOST_AT_LOW_RATE;
+  float highRateSmoothing = baseSmoothing - ADAPTIVE_SMOOTHING_REDUCTION_AT_HIGH_RATE;
+  float effectiveSmoothing = lowRateSmoothing;
+
+  if (absGyroZ >= ADAPTIVE_DAMPER_HIGH_DPS) {
+    effectiveSmoothing = highRateSmoothing;
+  } else if (absGyroZ > ADAPTIVE_DAMPER_LOW_DPS) {
+    float t = (absGyroZ - ADAPTIVE_DAMPER_LOW_DPS) /
+              (ADAPTIVE_DAMPER_HIGH_DPS - ADAPTIVE_DAMPER_LOW_DPS);
+    effectiveSmoothing =
+      lowRateSmoothing + t * (highRateSmoothing - lowRateSmoothing);
+  }
+
+  return constrainFloat(effectiveSmoothing, 0.55f, 0.85f);
+}
+
+float calculateAdaptiveDeadband(float baseDeadbandDps, float absGyroZ) {
+  float lowRateDeadband =
+    baseDeadbandDps + ADAPTIVE_DEADBAND_BOOST_AT_LOW_RATE_DPS;
+  float highRateDeadband =
+    baseDeadbandDps - ADAPTIVE_DEADBAND_REDUCTION_AT_HIGH_RATE_DPS;
+  float effectiveDeadband = lowRateDeadband;
+
+  if (absGyroZ >= ADAPTIVE_DAMPER_HIGH_DPS) {
+    effectiveDeadband = highRateDeadband;
+  } else if (absGyroZ > ADAPTIVE_DAMPER_LOW_DPS) {
+    float t = (absGyroZ - ADAPTIVE_DAMPER_LOW_DPS) /
+              (ADAPTIVE_DAMPER_HIGH_DPS - ADAPTIVE_DAMPER_LOW_DPS);
+    effectiveDeadband =
+      lowRateDeadband + t * (highRateDeadband - lowRateDeadband);
+  }
+
+  return constrainFloat(effectiveDeadband, 1.0f, 4.0f);
+}
+
+float calculateProgressiveGainFactor(float absGyroZ) {
+  if (absGyroZ <= PROGRESSIVE_GAIN_START_DPS) {
+    return PROGRESSIVE_GAIN_MIN_FACTOR;
+  }
+
+  if (absGyroZ >= PROGRESSIVE_GAIN_FULL_DPS) {
+    return PROGRESSIVE_GAIN_MAX_FACTOR;
+  }
+
+  float t = (absGyroZ - PROGRESSIVE_GAIN_START_DPS) /
+            (PROGRESSIVE_GAIN_FULL_DPS - PROGRESSIVE_GAIN_START_DPS);
+  return PROGRESSIVE_GAIN_MIN_FACTOR +
+         t * (PROGRESSIVE_GAIN_MAX_FACTOR - PROGRESSIVE_GAIN_MIN_FACTOR);
+}
+
 float calculateDriverPriorityFactor(uint16_t receiverPulseUs) {
   uint16_t steeringDistanceUs =
     abs((int16_t)receiverPulseUs - (int16_t)steeringNeutralUs);
@@ -645,7 +722,13 @@ void debugPrint(bool radioOk,
                 bool damperValid,
                 bool ch4Active,
                 float gyroZDps,
+                float absGyroZ,
+                float effectiveSmoothing,
+                float effectiveDeadband,
+                float progressiveFactor,
+                float effectiveGain,
                 float correctionUs,
+                float driverPriorityFactor,
                 uint16_t servoPulseUs) {
   if (!DEBUG_SERIAL) {
     return;
@@ -688,8 +771,20 @@ void debugPrint(bool radioOk,
   Serial.print((uint8_t)recalState);
   Serial.print(F(" gyroZ="));
   Serial.print(gyroZDps, 2);
+  Serial.print(F(" absGyroZ="));
+  Serial.print(absGyroZ, 2);
+  Serial.print(F(" effSmooth="));
+  Serial.print(effectiveSmoothing, 2);
+  Serial.print(F(" effDeadband="));
+  Serial.print(effectiveDeadband, 2);
+  Serial.print(F(" prog="));
+  Serial.print(progressiveFactor, 2);
+  Serial.print(F(" effGain="));
+  Serial.print(effectiveGain, 2);
   Serial.print(F(" corr="));
   Serial.print(correctionUs, 1);
+  Serial.print(F(" priority="));
+  Serial.print(driverPriorityFactor, 2);
   Serial.print(F(" out="));
   Serial.println(servoPulseUs);
 }
@@ -720,6 +815,12 @@ void runControlLoop(uint32_t nowUs) {
                recalButtonActive,
                0.0f,
                0.0f,
+               activeSmoothingAlpha,
+               activeGyroDeadbandDps,
+               PROGRESSIVE_GAIN_MIN_FACTOR,
+               0.0f,
+               0.0f,
+               1.0f,
                SERVO_CENTER_US);
     return;
   }
@@ -739,6 +840,12 @@ void runControlLoop(uint32_t nowUs) {
                recalButtonActive,
                0.0f,
                0.0f,
+               activeSmoothingAlpha,
+               activeGyroDeadbandDps,
+               PROGRESSIVE_GAIN_MIN_FACTOR,
+               0.0f,
+               0.0f,
+               1.0f,
                SERVO_CENTER_US);
     return;
   }
@@ -750,28 +857,42 @@ void runControlLoop(uint32_t nowUs) {
     gyroZDps = 0.0f;
   }
 
+  float absGyroZ = absFloat(gyroZDps);
+  float effectiveSmoothing =
+    calculateAdaptiveSmoothing(activeSmoothingAlpha, absGyroZ);
+  float effectiveDeadband =
+    calculateAdaptiveDeadband(activeGyroDeadbandDps, absGyroZ);
+  float progressiveFactor = calculateProgressiveGainFactor(absGyroZ);
+  float effectiveGain = activeGyroGain * progressiveFactor;
+  float driverPriorityFactor = calculateDriverPriorityFactor(receiverPulseUs);
+  float activeCorrectionLimitUs =
+    (float)GYRO_CORRECTION_LIMIT_US * driverPriorityFactor;
+
   if (!activeGyroEnabled) {
     filteredCorrectionUs = 0.0f;
+    effectiveGain = 0.0f;
   } else {
-    if (gyroZDps > -activeGyroDeadbandDps && gyroZDps < activeGyroDeadbandDps) {
-      gyroZDps = 0.0f;
+    float gyroForCorrectionDps = gyroZDps;
+    if (gyroForCorrectionDps > -effectiveDeadband &&
+        gyroForCorrectionDps < effectiveDeadband) {
+      gyroForCorrectionDps = 0.0f;
     }
 
-    float correctionUs = gyroZDps * activeGyroGain;
+    float correctionUs = gyroForCorrectionDps * effectiveGain;
     if (GYRO_REVERSE) {
       correctionUs = -correctionUs;
     }
 
-    float priorityFactor = calculateDriverPriorityFactor(receiverPulseUs);
-    float activeCorrectionLimitUs = (float)GYRO_CORRECTION_LIMIT_US * priorityFactor;
-
+    correctionUs = clampFloat(correctionUs,
+                              -(float)GYRO_CORRECTION_LIMIT_US,
+                              (float)GYRO_CORRECTION_LIMIT_US);
     correctionUs = clampFloat(correctionUs,
                               -activeCorrectionLimitUs,
                               activeCorrectionLimitUs);
 
     filteredCorrectionUs =
-      filteredCorrectionUs * activeSmoothingAlpha +
-      correctionUs * (1.0f - activeSmoothingAlpha);
+      filteredCorrectionUs * effectiveSmoothing +
+      correctionUs * (1.0f - effectiveSmoothing);
 
     filteredCorrectionUs = clampFloat(filteredCorrectionUs,
                                       -activeCorrectionLimitUs,
@@ -794,7 +915,13 @@ void runControlLoop(uint32_t nowUs) {
              damperValid,
              recalButtonActive,
              gyroZDps,
+             absGyroZ,
+             effectiveSmoothing,
+             effectiveDeadband,
+             progressiveFactor,
+             effectiveGain,
              filteredCorrectionUs,
+             driverPriorityFactor,
              servoPulseUs);
 }
 
