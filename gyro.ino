@@ -55,7 +55,7 @@ const uint8_t RX_AUX_FILTER_SHIFT = 2;       // 2 = 25% pulso novo, bom para kno
 const uint16_t SERVO_CENTER_US = 1500;
 const uint16_t SERVO_LEFT_LIMIT_US = 1270;
 const uint16_t SERVO_RIGHT_LIMIT_US = 1730;
-const uint16_t SERVO_FRAME_US = 20000;  // 50 Hz
+const uint16_t SERVO_FRAME_US = 3030;  // 330 Hz
 
 // Inverta se o servo estiver respondendo ao contrario do radio.
 const bool SERVO_REVERSE = false;
