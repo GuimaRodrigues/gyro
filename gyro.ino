@@ -2,6 +2,8 @@
 #include <Wire.h>
 #include <avr/interrupt.h>
 
+
+
 /*
   Firmware simples para gyro de drift RC RWD 1/10 com Arduino Uno/Nano e MPU6050.
 
@@ -104,7 +106,7 @@ const int16_t PROGRESSIVE_GAIN_FULL_CENTI_DPS = 12000;
 const int16_t PROGRESSIVE_GAIN_MIN_FACTOR_Q1000 = 750;
 const int16_t PROGRESSIVE_GAIN_MAX_FACTOR_Q1000 = 1180;
 
-const int16_t GYRO_CORRECTION_LIMIT_US = 250;
+const int16_t GYRO_CORRECTION_LIMIT_US = 230;
 const uint16_t DRIVER_PRIORITY_FULL_STEER_US = 230;
 const int16_t DRIVER_PRIORITY_MIN_FACTOR_Q1000 = 550;
 
@@ -126,6 +128,11 @@ const uint16_t STATUS_LED_LONG_OFF_MS = 250;
 const bool DEBUG_SERIAL = false;
 const uint32_t DEBUG_BAUD = 115200;
 const uint16_t DEBUG_INTERVAL_MS = 100;
+const bool STANDALONE_TEST = false;
+
+const uint16_t TEST_STEERING_US = 1500;
+const uint16_t TEST_GAIN_US = 1500;
+const uint16_t TEST_DAMPER_US = 1000;
 
 // ------------------------- Registradores do MPU6050 -------------------------
 const uint8_t MPU_REG_SMPLRT_DIV = 0x19;
@@ -186,6 +193,14 @@ enum RecalState {
   RECAL_SAMPLING_OFFSET,
   RECAL_WAIT_RELEASE
 };
+
+PulseSnapshot makeFakePulse(uint16_t pulseUs, uint32_t nowUs) {
+  PulseSnapshot p;
+  p.pulseUs = pulseUs;
+  p.lastPulseUs = nowUs;
+  p.hasPulse = true;
+  return p;
+}
 
 volatile RxChannel steeringChannel = {
   0, RX_COMMAND_CENTER_US, RX_COMMAND_CENTER_US * 16, 0, false, RX_STEERING_FILTER_SHIFT
@@ -1174,6 +1189,18 @@ void debugSafeControl(bool radioOk,
 void runControlLoop(uint32_t nowUs, uint32_t nowMs) {
   ReceiverSnapshot rx = readReceiverSnapshot(nowUs);
 
+  if (STANDALONE_TEST) {
+  rx.steering = makeFakePulse(TEST_STEERING_US, nowUs);
+  rx.gain = makeFakePulse(TEST_GAIN_US, nowUs);
+  rx.damper = makeFakePulse(TEST_DAMPER_US, nowUs);
+  rx.recal = makeFakePulse(1000, nowUs);
+
+  rx.steeringValid = true;
+  rx.gainValid = true;
+  rx.damperValid = true;
+  rx.recalValid = false;
+}
+
   updateGainAndDamper(rx.gain, rx.gainValid, rx.damper, rx.damperValid);
   updateRecalibration(nowUs,
                       nowMs,
@@ -1244,7 +1271,9 @@ void setup() {
 
   setupServoTimer50Hz();
   setServoPulseUs(SERVO_CENTER_US);
-  setupReceiverInputs();
+  if (!STANDALONE_TEST) {
+    setupReceiverInputs();
+  }
 
   if (!startMpu6050()) {
     mpuReady = false;
