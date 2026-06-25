@@ -64,7 +64,7 @@ const bool SERVO_REVERSE = false;
 
 // ------------------------- Gyro / controle -------------------------
 const uint8_t MPU6050_ADDRESS = 0x68;
-const uint32_t I2C_CLOCK_HZ = 400000UL;
+const uint32_t I2C_CLOCK_HZ = 100000UL;
 const uint8_t MPU6050_DLPF_CFG = 2;         // 2 = filtro interno ~94 Hz, baixa latencia
 const uint16_t GYRO_CALIBRATION_SAMPLES = 1500;
 const uint16_t GYRO_CALIBRATION_INTERVAL_US = 1000;
@@ -80,7 +80,7 @@ const int16_t GYRO_RAW_TO_CENTI_DPS_NUM = 1000;
 const int16_t GYRO_RAW_TO_CENTI_DPS_DEN = 655;
 
 // Inverta se o gyro corrigir para o lado errado.
-const bool GYRO_REVERSE = false;
+const bool GYRO_REVERSE = true;
 
 const int16_t GYRO_GAIN_MIN_Q1000 = 0;
 const int16_t GYRO_GAIN_MAX_Q1000 = 3000;
@@ -125,7 +125,7 @@ const uint16_t STATUS_LED_LONG_ON_MS = 350;
 const uint16_t STATUS_LED_LONG_OFF_MS = 250;
 
 // ------------------------- Debug -------------------------
-const bool DEBUG_SERIAL = false;
+const bool DEBUG_SERIAL = true;
 const uint32_t DEBUG_BAUD = 115200;
 const uint16_t DEBUG_INTERVAL_MS = 100;
 const bool STANDALONE_TEST = false;
