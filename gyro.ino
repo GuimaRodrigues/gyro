@@ -47,16 +47,17 @@ const uint8_t SERVO_OUTPUT_PIN = 9;    // Saida do servo gerada por Timer1
 // ------------------------- Servo / receptor -------------------------
 const uint16_t RX_COMMAND_MIN_US = 1000;
 const uint16_t RX_COMMAND_CENTER_US = 1500;
+const uint16_t RX_STEERING_NEUTRAL_US = 1572;
 const uint16_t RX_COMMAND_MAX_US = 2000;
 const uint16_t RX_VALID_MIN_US = 900;
-const uint16_t RX_VALID_MAX_US = 2100;
+const uint16_t RX_VALID_MAX_US = 2300;
 const uint32_t RX_SIGNAL_TIMEOUT_US = 100000UL;
 const uint8_t RX_STEERING_FILTER_SHIFT = 1;  // 1 = 50% pulso novo, reduz jitter sem muito atraso
 const uint8_t RX_AUX_FILTER_SHIFT = 2;       // 2 = 25% pulso novo, bom para knobs/botao
 
-const uint16_t SERVO_CENTER_US = 1500;
-const uint16_t SERVO_LEFT_LIMIT_US = 1270;
-const uint16_t SERVO_RIGHT_LIMIT_US = 1730;
+const uint16_t SERVO_CENTER_US = 1612;
+const uint16_t SERVO_LEFT_LIMIT_US = 1210;
+const uint16_t SERVO_RIGHT_LIMIT_US = 2000;
 const uint16_t SERVO_FRAME_US = 3030;  // 330 Hz
 
 // Inverta se o servo estiver respondendo ao contrario do radio.
@@ -80,12 +81,13 @@ const int16_t GYRO_RAW_TO_CENTI_DPS_NUM = 1000;
 const int16_t GYRO_RAW_TO_CENTI_DPS_DEN = 655;
 
 // Inverta se o gyro corrigir para o lado errado.
-const bool GYRO_REVERSE = true;
+const bool GYRO_REVERSE = false;
 
 const int16_t GYRO_GAIN_MIN_Q1000 = 0;
 const int16_t GYRO_GAIN_MAX_Q1000 = 3000;
 const uint16_t GYRO_GAIN_OFF_THRESHOLD_US = 1080;
 const int16_t GYRO_GAIN_FAILSAFE_Q1000 = 1500;
+const bool GYRO_GAIN_REVERSE = true;
 
 const int16_t DAMPER_SMOOTHING_MIN_Q1000 = 600;
 const int16_t DAMPER_SMOOTHING_MAX_Q1000 = 800;
@@ -93,6 +95,7 @@ const int16_t DAMPER_DEADBAND_MIN_CENTI_DPS = 150;
 const int16_t DAMPER_DEADBAND_MAX_CENTI_DPS = 300;
 const int16_t DAMPER_FAILSAFE_SMOOTHING_Q1000 = 700;
 const int16_t DAMPER_FAILSAFE_DEADBAND_CENTI_DPS = 200;
+const bool DAMPER_REVERSE = true;
 
 const int16_t ADAPTIVE_DAMPER_LOW_CENTI_DPS = 800;
 const int16_t ADAPTIVE_DAMPER_HIGH_CENTI_DPS = 8000;
@@ -125,7 +128,7 @@ const uint16_t STATUS_LED_LONG_ON_MS = 350;
 const uint16_t STATUS_LED_LONG_OFF_MS = 250;
 
 // ------------------------- Debug -------------------------
-const bool DEBUG_SERIAL = true;
+const bool DEBUG_SERIAL = false;
 const uint32_t DEBUG_BAUD = 115200;
 const uint16_t DEBUG_INTERVAL_MS = 100;
 const bool STANDALONE_TEST = false;
@@ -230,7 +233,7 @@ int16_t activeGyroGainQ1000 = GYRO_GAIN_FAILSAFE_Q1000;
 int16_t activeSmoothingQ1000 = DAMPER_FAILSAFE_SMOOTHING_Q1000;
 int16_t activeGyroDeadbandCentiDps = DAMPER_FAILSAFE_DEADBAND_CENTI_DPS;
 bool activeGyroEnabled = true;
-uint16_t steeringNeutralUs = RX_COMMAND_CENTER_US;
+uint16_t steeringNeutralUs = RX_STEERING_NEUTRAL_US;
 uint32_t lastControlUs = 0;
 uint32_t mpuWakeStartMs = 0;
 uint32_t initialCalNextSampleUs = 0;
@@ -244,7 +247,7 @@ uint32_t recalNextSampleUs = 0;
 uint16_t recalAttemptSamples = 0;
 uint16_t recalGoodSamples = 0;
 int32_t recalRawSum = 0;
-uint16_t recalPendingNeutralUs = RX_COMMAND_CENTER_US;
+uint16_t recalPendingNeutralUs = RX_STEERING_NEUTRAL_US;
 bool recalButtonActive = false;
 
 bool statusLedBlinkActive = false;
@@ -258,6 +261,7 @@ uint32_t statusLedLastChangeMs = 0;
 uint16_t clampPulse(uint16_t value, uint16_t low, uint16_t high);
 int16_t clampInt16(int16_t value, int16_t low, int16_t high);
 int32_t clampInt32(int32_t value, int32_t low, int32_t high);
+uint16_t maybeReverseCommandPulse(uint16_t pulseUs, bool reverse);
 int16_t mapPulseToScaled(uint16_t pulseUs, int16_t low, int16_t high);
 int32_t absInt32(int32_t value);
 bool hasEnoughGoodSamples(uint16_t goodSamples, uint16_t totalSamples);
@@ -342,6 +346,15 @@ int32_t clampInt32(int32_t value, int32_t low, int32_t high) {
   if (value < low) return low;
   if (value > high) return high;
   return value;
+}
+
+uint16_t maybeReverseCommandPulse(uint16_t pulseUs, bool reverse) {
+  uint16_t clipped = clampPulse(pulseUs, RX_COMMAND_MIN_US, RX_COMMAND_MAX_US);
+  if (!reverse) {
+    return clipped;
+  }
+
+  return (uint16_t)(RX_COMMAND_MIN_US + RX_COMMAND_MAX_US - clipped);
 }
 
 int16_t mapPulseToScaled(uint16_t pulseUs, int16_t low, int16_t high) {
@@ -666,13 +679,16 @@ void updateGainAndDamper(const PulseSnapshot &gain,
                          const PulseSnapshot &damper,
                          bool damperValid) {
   if (gainValid) {
-    if (gain.pulseUs < GYRO_GAIN_OFF_THRESHOLD_US) {
+    uint16_t gainControlUs =
+      maybeReverseCommandPulse(gain.pulseUs, GYRO_GAIN_REVERSE);
+
+    if (gainControlUs < GYRO_GAIN_OFF_THRESHOLD_US) {
       activeGyroEnabled = false;
       activeGyroGainQ1000 = 0;
     } else {
       activeGyroEnabled = true;
       activeGyroGainQ1000 =
-        mapPulseToScaled(gain.pulseUs, GYRO_GAIN_MIN_Q1000, GYRO_GAIN_MAX_Q1000);
+        mapPulseToScaled(gainControlUs, GYRO_GAIN_MIN_Q1000, GYRO_GAIN_MAX_Q1000);
     }
   } else {
     activeGyroEnabled = true;
@@ -680,12 +696,15 @@ void updateGainAndDamper(const PulseSnapshot &gain,
   }
 
   if (damperValid) {
+    uint16_t damperControlUs =
+      maybeReverseCommandPulse(damper.pulseUs, DAMPER_REVERSE);
+
     activeSmoothingQ1000 =
-      mapPulseToScaled(damper.pulseUs,
+      mapPulseToScaled(damperControlUs,
                        DAMPER_SMOOTHING_MIN_Q1000,
                        DAMPER_SMOOTHING_MAX_Q1000);
     activeGyroDeadbandCentiDps =
-      mapPulseToScaled(damper.pulseUs,
+      mapPulseToScaled(damperControlUs,
                        DAMPER_DEADBAND_MIN_CENTI_DPS,
                        DAMPER_DEADBAND_MAX_CENTI_DPS);
   } else {
